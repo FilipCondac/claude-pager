@@ -1,8 +1,8 @@
 class ClaudePager < Formula
   desc "Approve Claude Code permission prompts from your phone"
   homepage "https://github.com/FilipCondac/claude-pager"
-  url "https://github.com/FilipCondac/claude-pager/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "32040e430300a44f9c9adc8e145c7b693e721ecf22aee406d20e78435ffc5225"
+  url "https://github.com/FilipCondac/claude-pager/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "13334f19e47c8ebd06dcee90173c9b0935274ac600c24abd56b688b52c05f80c"
   license "MIT"
 
   depends_on "tmux"
