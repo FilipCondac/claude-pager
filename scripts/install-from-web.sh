@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Web installer for claude-pager. Users run:
-#   curl -fsSL https://raw.githubusercontent.com/REPLACE_OWNER/claude-pager/main/scripts/install-from-web.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/FilipCondac/claude-pager/main/scripts/install-from-web.sh | bash
 # It clones the repo to ~/.local/share/claude-pager-src and runs install.sh.
 set -euo pipefail
 
-REPO="${CLAUDE_PAGER_REPO:-https://github.com/REPLACE_OWNER/claude-pager.git}"
+REPO="${CLAUDE_PAGER_REPO:-https://github.com/FilipCondac/claude-pager.git}"
 DEST="${CLAUDE_PAGER_SRC:-$HOME/.local/share/claude-pager-src}"
 
 command -v git >/dev/null || { echo "git is required"; exit 1; }
