@@ -4,6 +4,43 @@ Approve or deny Claude Code permission prompts from your phone, anywhere.
 
 No Tailscale. No SSH server. No iOS Shortcuts. No port forwarding.
 
+## Quick start
+
+**1. Install the ntfy app** on your iPhone (free, from the App Store).
+
+**2. Install claude-pager on your Mac:**
+
+```sh
+brew tap FilipCondac/claude-pager
+brew install claude-pager
+```
+
+**3. Run the per-user setup** — generates your unique topic + HMAC secret, installs the background daemon (LaunchAgent), and wires the Claude Code hook:
+
+```sh
+CLAUDE_PAGER_PLIST_TEMPLATE="$(brew --prefix)/share/claude-pager/launchd/com.claudepager.daemon.plist.template" \
+  claude-pager-setup
+```
+
+The setup prints a topic name like `cp-req-aB3xQ...`. **Open ntfy on your phone → tap `+` → paste the topic → Subscribe.**
+
+**4. Test it:**
+
+```sh
+claude-pager-test
+```
+
+You should get a push notification on your phone within a second.
+
+**5. Run Claude inside tmux** (the daemon needs tmux to send keystrokes back):
+
+```sh
+tmux new -s claude
+claude
+```
+
+That's it. Next time Claude asks for permission to run a Bash command, edit a file, etc., you'll get a notification on your phone with Approve / Always / Deny buttons. If you respond on the Mac first (within 20s), no notification fires.
+
 ## How it works
 
 ```
