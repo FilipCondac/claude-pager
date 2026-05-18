@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Show the current state of claude-pager: daemon, config, inflight, log tail."""
+import json
+import os
+import subprocess
+import sys
+import time
+
+CONFIG_PATH = os.path.expanduser("~/.config/claude-pager/config.json")
+PENDING_PATH = os.path.expanduser("~/.config/claude-pager/pending.json")
+INFLIGHT_DIR = os.path.expanduser("~/.config/claude-pager/inflight")
+LOG_PATH = os.path.expanduser("~/Library/Logs/claude-pager.log")
+PLIST_PATH = os.path.expanduser("~/Library/LaunchAgents/com.claudepager.daemon.plist")
+
+
+def bold(s):
+    return f"\033[1m{s}\033[0m"
+
+
+def main():
+    print(bold("claude-pager status"))
+    print()
+
+    # Config
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        print(f"  config:   {CONFIG_PATH}")
+        print(f"  topic:    {cfg.get('request_topic')}")
+        print(f"  server:   {cfg.get('server', 'https://ntfy.sh')}")
+        delay = cfg.get("delay_seconds", 20)
+        if isinstance(delay, dict):
+            print(f"  delays:   per-tool {delay}")
+        else:
+            print(f"  delay:    {delay}s")
+        gate = cfg.get("gate") or ["Bash", "Write", "Edit", "WebFetch"]
+        print(f"  gate:     {', '.join(gate)}")
+    except FileNotFoundError:
+        print("  config:   MISSING -- run claude-pager-setup")
+        return 1
+
+    # Daemon
+    print()
+    label = "com.claudepager.daemon"
+    res = subprocess.run(["launchctl", "list", label], capture_output=True, text=True)
+    if res.returncode == 0:
+        # Extract PID
+        pid = None
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if line.startswith('"PID"'):
+                pid = line.split("=", 1)[1].strip().rstrip(";").strip()
+                break
+        if pid and pid != "0":
+            print(f"  daemon:   running (pid {pid})")
+        else:
+            print(f"  daemon:   loaded but not running")
+    else:
+        print(f"  daemon:   not loaded ({PLIST_PATH})")
+
+    # Inflight
+    print()
+    if os.path.isdir(INFLIGHT_DIR):
+        files = sorted(f for f in os.listdir(INFLIGHT_DIR) if f.endswith(".json"))
+    else:
+        files = []
+    if files:
+        print(f"  inflight: {len(files)} pending")
+        for fn in files[:5]:
+            try:
+                with open(os.path.join(INFLIGHT_DIR, fn)) as f:
+                    d = json.load(f)
+                age = int(time.time() - d.get("ts", time.time()))
+                print(f"    - {d.get('tool_name', '?')} ({age}s ago, target={d.get('target')})")
+            except Exception:
+                pass
+    else:
+        print("  inflight: 0 pending")
+
+    # Recent log lines
+    print()
+    print(bold("recent log:"))
+    try:
+        with open(LOG_PATH) as f:
+            tail = f.readlines()[-8:]
+        for line in tail:
+            print(f"  {line.rstrip()}")
+    except FileNotFoundError:
+        print("  (no log yet)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

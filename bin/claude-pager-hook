@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""
+Claude Code hook. Handles PreToolUse, PostToolUse, Stop, Notification.
+
+For tool calls we DELAY notifying the phone until `delay_seconds` of idle have
+elapsed without the user answering Claude's inline prompt locally. The flow:
+
+  1. PreToolUse  : write inflight/<event_id>.json, spawn a detached timer.
+  2. PostToolUse : delete inflight/<event_id>.json (user answered locally).
+  3. Stop        : delete all inflight files for the session (handles denial
+                   and any other terminal state).
+  4. Timer       : after delay_seconds, if inflight/<event_id>.json still
+                   exists, publish the ntfy notification.
+
+The daemon ignores phone votes whose inflight file is no longer present, so a
+late tap can't type "1" into whatever Claude is doing next.
+
+Invoked two ways:
+  * via Claude Code hook (event payload on stdin)
+  * as `claude-pager-hook --notify <event_id> <delay_seconds>` (timer mode)
+"""
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+CONFIG_DIR = os.path.expanduser("~/.config/claude-pager")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+PENDING_PATH = os.path.join(CONFIG_DIR, "pending.json")
+INFLIGHT_DIR = os.path.join(CONFIG_DIR, "inflight")
+CONFIRMED_DIR = os.path.join(CONFIG_DIR, "confirmed")
+DEFAULT_GATE = ["Bash", "Write", "Edit", "WebFetch"]
+DEFAULT_DELAY = 20
+DEBUG_LOG = os.path.expanduser("~/Library/Logs/claude-pager-hook.log")
+DEBUG_ENABLED = os.environ.get("CLAUDE_PAGER_DEBUG") == "1"
+
+
+def dbg(msg):
+    if not DEBUG_ENABLED:
+        return
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def load_config():
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def sign(secret_hex, vote, nonce):
+    key = bytes.fromhex(secret_hex)
+    return hmac.new(key, f"{vote}:{nonce}".encode(), hashlib.sha256).hexdigest()[:16]
+
+
+def tmux_target_for_self():
+    if not os.environ.get("TMUX"):
+        return None
+    tmux = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+    try:
+        out = subprocess.run(
+            [tmux, "display-message", "-p", "#{session_name}:#{window_index}"],
+            capture_output=True, text=True, check=True, timeout=2,
+        )
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def truncate(s, n):
+    s = (s or "").replace("\n", " ⏎ ")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def summarize_tool(name, inp):
+    inp = inp if isinstance(inp, dict) else {}
+    if name == "Bash":
+        return f"$ {truncate(inp.get('command', ''), 240)}"
+    if name in ("Edit", "Write", "Read", "NotebookEdit"):
+        return f"{name} {truncate(inp.get('file_path') or inp.get('path', ''), 220)}"
+    if name == "WebFetch":
+        return f"WebFetch {truncate(inp.get('url', ''), 220)}"
+    if name == "WebSearch":
+        return f"WebSearch {truncate(inp.get('query', ''), 220)}"
+    parts = [f"{k}={truncate(str(v), 80)}" for k, v in list(inp.items())[:2]]
+    return f"{name} {' '.join(parts)}".strip()
+
+
+def resolve_delay(cfg, tool_name):
+    """delay_seconds can be a number (universal) or a dict mapping tool name
+    to seconds (with optional `default` key). Returns int seconds."""
+    val = cfg.get("delay_seconds", DEFAULT_DELAY)
+    if isinstance(val, dict):
+        return int(val.get(tool_name, val.get("default", DEFAULT_DELAY)))
+    return int(val)
+
+
+def session_label(target, cfg):
+    """If the target tmux session is something other than the default
+    `claude:0`, return a short label to include in the notification title so
+    multi-session users can tell which Claude is asking."""
+    default_target = cfg.get("tmux_target", "claude:0")
+    if target and target != default_target:
+        return target.split(":", 1)[0]
+    return ""
+
+
+def event_id(payload):
+    """Use Claude's stable tool_use_id when present (survives PreToolUse
+    command rewrites by hooks like rtk). Fall back to a fingerprint."""
+    tid = payload.get("tool_use_id")
+    if tid:
+        return str(tid)
+    h = hashlib.sha256()
+    h.update((payload.get("session_id") or "").encode())
+    h.update((payload.get("tool_name") or "").encode())
+    h.update(json.dumps(payload.get("tool_input") or {}, sort_keys=True).encode())
+    return h.hexdigest()[:16]
+
+
+def inflight_path(eid):
+    return os.path.join(INFLIGHT_DIR, f"{eid}.json")
+
+
+def sweep_old_inflight(max_age_seconds=3600):
+    if not os.path.isdir(INFLIGHT_DIR):
+        return
+    now = time.time()
+    for fn in os.listdir(INFLIGHT_DIR):
+        if not fn.endswith(".json"):
+            continue
+        path = os.path.join(INFLIGHT_DIR, fn)
+        try:
+            if now - os.path.getmtime(path) > max_age_seconds:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def write_inflight(eid, data):
+    sweep_old_inflight()
+    os.makedirs(INFLIGHT_DIR, exist_ok=True)
+    os.chmod(INFLIGHT_DIR, 0o700)
+    path = inflight_path(eid)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def read_inflight(eid):
+    try:
+        with open(inflight_path(eid)) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def clear_inflight(eid):
+    try:
+        os.remove(inflight_path(eid))
+    except FileNotFoundError:
+        pass
+
+
+def clear_inflight_for_session(session_id):
+    if not os.path.isdir(INFLIGHT_DIR):
+        return
+    for fn in os.listdir(INFLIGHT_DIR):
+        path = os.path.join(INFLIGHT_DIR, fn)
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("session_id") == session_id:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+
+def record_pending(nonce, target, eid):
+    os.makedirs(os.path.dirname(PENDING_PATH), exist_ok=True)
+    try:
+        with open(PENDING_PATH) as f:
+            pending = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pending = {}
+    now = time.time()
+    pending = {n: v for n, v in pending.items() if now - v.get("ts", 0) < 3600}
+    pending[nonce] = {"ts": now, "target": target, "event_id": eid}
+    tmp = PENDING_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(pending, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PENDING_PATH)
+
+
+def publish(cfg, title, body, target, eid, votes=None):
+    """votes is a list of (vote_key, button_label) tuples. Defaults to the
+    standard Approve / Always / Deny set for permission prompts."""
+    nonce = secrets.token_urlsafe(8)
+    record_pending(nonce, target, eid)
+    title_unique = f"{title} #{nonce[:4]}"
+    server = cfg.get("server", "https://ntfy.sh")
+    response_url = f"{server}/{cfg['response_topic']}"
+    if votes is None:
+        votes = [("approve", "Approve"), ("allow_always", "Always"), ("deny", "Deny")]
+    parts = []
+    for vote, label in votes:
+        parts.append(
+            f"http, {label}, {response_url}, "
+            f"body={vote}:{nonce}:{sign(cfg['secret'], vote, nonce)}, clear=true"
+        )
+    actions = "; ".join(parts) if parts else None
+    headers = {
+        "Title": title_unique,
+        "Priority": "max",
+        "Tags": "bell",
+    }
+    if actions:
+        headers["Actions"] = actions
+    req = urllib.request.Request(
+        f"{server}/{cfg['request_topic']}",
+        data=body.encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        msg = f"publish failed ({e})"
+        print(f"claude-pager: {msg}", file=sys.stderr)
+        try:
+            with open(os.path.expanduser("~/Library/Logs/claude-pager.log"), "a") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+
+
+def handle_pretooluse(payload, cfg):
+    tool_name = payload.get("tool_name", "")
+    if tool_name == "AskUserQuestion":
+        return handle_ask_user_question(payload, cfg)
+    if tool_name not in cfg.get("gate", DEFAULT_GATE):
+        dbg(f"PRE  {tool_name} skipped (not in gate)")
+        return
+    session_id = payload.get("session_id", "")
+    tool_input = payload.get("tool_input", {})
+    eid = event_id(payload)
+    dbg(f"PRE  {tool_name} eid={eid} session={session_id[:8]} input={json.dumps(tool_input, sort_keys=True)[:200]}")
+    target = tmux_target_for_self() or cfg.get("tmux_target", "claude:0")
+    write_inflight(eid, {
+        "session_id": session_id,
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "target": target,
+        "ts": time.time(),
+        "cwd": payload.get("cwd", ""),
+    })
+    delay = resolve_delay(cfg, tool_name)
+    subprocess.Popen(
+        [sys.executable, os.path.realpath(__file__), "--notify", eid, str(delay)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def handle_ask_user_question(payload, cfg):
+    """Surface up to 3 of the first question's options as phone buttons."""
+    tool_input = payload.get("tool_input", {}) if isinstance(payload.get("tool_input"), dict) else {}
+    questions = tool_input.get("questions", [])
+    if not questions:
+        return
+    q = questions[0]
+    question_text = q.get("question", "")
+    header = q.get("header", "")
+    options = q.get("options") or []
+    if not options:
+        return
+    # ntfy.sh hard-limits action buttons to 3. 4+ options falls back to a
+    # passive "finish on Mac" alert. Multi-select also passive.
+    passive = bool(q.get("multiSelect")) or len(options) > 3
+
+    session_id = payload.get("session_id", "")
+    eid = event_id(payload)
+    target = tmux_target_for_self() or cfg.get("tmux_target", "claude:0")
+    delay = resolve_delay(cfg, "AskUserQuestion")
+    write_inflight(eid, {
+        "session_id": session_id,
+        "tool_name": "AskUserQuestion",
+        "tool_input": tool_input,
+        "target": target,
+        "ts": time.time(),
+        "cwd": payload.get("cwd", ""),
+        "options": [o.get("label", str(i)) for i, o in enumerate(options[:3])],
+        "passive": passive,
+    })
+    subprocess.Popen(
+        [sys.executable, os.path.realpath(__file__), "--notify", eid, str(delay)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    dbg(f"PRE  AskUserQuestion eid={eid} options={len(options)}")
+
+
+def handle_posttooluse(payload, cfg):
+    tool_name = payload.get("tool_name", "")
+    tool_input = payload.get("tool_input", {})
+    eid = event_id(payload)
+    existed = os.path.exists(inflight_path(eid))
+    sid = payload.get("session_id", "")
+    dbg(f"POST {tool_name} eid={eid} session={sid[:8]} existed={existed} input={json.dumps(tool_input, sort_keys=True)[:200] if isinstance(tool_input, dict) else 'n/a'}")
+    clear_inflight(eid)
+    # If this event was phone-approved, send an outcome confirmation.
+    confirmed_path = os.path.join(CONFIRMED_DIR, f"{eid}.json")
+    if os.path.exists(confirmed_path):
+        publish_outcome(cfg, tool_name, payload.get("tool_response"))
+        try:
+            os.remove(confirmed_path)
+        except FileNotFoundError:
+            pass
+
+
+def handle_stop(payload, cfg):
+    clear_inflight_for_session(payload.get("session_id", ""))
+    # Also sweep any abandoned confirmed/ markers older than 1h.
+    if os.path.isdir(CONFIRMED_DIR):
+        now = time.time()
+        for fn in os.listdir(CONFIRMED_DIR):
+            path = os.path.join(CONFIRMED_DIR, fn)
+            try:
+                if now - os.path.getmtime(path) > 3600:
+                    os.remove(path)
+            except OSError:
+                pass
+
+
+def publish_outcome(cfg, tool_name, tool_response):
+    """Send a low-priority follow-up showing the outcome of a phone-approved
+    tool call. Tool_response is whatever Claude Code provides in PostToolUse —
+    usually a stdout/stderr/exit dict, sometimes a string, sometimes missing."""
+    if not cfg.get("confirm_delivery", True):
+        return
+    success = True
+    detail = ""
+    if isinstance(tool_response, dict):
+        if "is_error" in tool_response:
+            success = not tool_response.get("is_error")
+        if "stderr" in tool_response and tool_response["stderr"]:
+            detail = str(tool_response["stderr"])
+        elif "error" in tool_response:
+            detail = str(tool_response["error"])
+        elif "stdout" in tool_response:
+            detail = str(tool_response["stdout"])
+        elif "content" in tool_response:
+            c = tool_response["content"]
+            detail = c if isinstance(c, str) else json.dumps(c)[:300]
+    elif isinstance(tool_response, str):
+        detail = tool_response
+    detail = truncate(detail.strip(), 200) if detail else ""
+    title = f"{tool_name} done" if success else f"{tool_name} failed"
+    body = detail or ("OK" if success else "failed")
+    import urllib.request
+    server = cfg.get("server", "https://ntfy.sh")
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"{server}/{cfg['request_topic']}",
+                data=body.encode("utf-8"),
+                headers={
+                    "Title": title,
+                    "Priority": "low" if success else "default",
+                    "Tags": "white_check_mark" if success else "x",
+                },
+                method="POST",
+            ),
+            timeout=5,
+        ).read()
+    except Exception as e:
+        print(f"claude-pager: outcome publish failed: {e}", file=sys.stderr)
+
+
+def handle_notification(payload, cfg):
+    # Claude's idle pings aren't actionable from the phone (Approve/Deny doesn't
+    # help when Claude is just waiting for your next message). Off by default;
+    # set "notify_on_idle": true in config.json to opt back in.
+    if not cfg.get("notify_on_idle", False) and os.environ.get("CLAUDE_PAGER_FORCE_NOTIFY") != "1":
+        return
+    prompt = payload.get("message", "Claude needs your attention")
+    target = tmux_target_for_self() or cfg.get("tmux_target", "claude:0")
+    publish(cfg, "Claude waiting", prompt, target, "idle")
+
+
+def notify_mode(eid, delay):
+    time.sleep(int(delay))
+    inflight = read_inflight(eid)
+    if not inflight:
+        dbg(f"TIMER eid={eid} cleared before fire, exiting")
+        return
+    dbg(f"TIMER eid={eid} firing notification")
+    try:
+        cfg = load_config()
+    except FileNotFoundError:
+        return
+    name = inflight.get("tool_name", "")
+    target = inflight.get("target") or cfg.get("tmux_target", "claude:0")
+    label = session_label(target, cfg)
+    cwd = inflight.get("cwd", "") or os.environ.get("PWD", "")
+    cwd_short = os.path.basename(cwd) if cwd else ""
+
+    if name == "AskUserQuestion":
+        tool_input = inflight.get("tool_input", {})
+        questions = tool_input.get("questions", []) if isinstance(tool_input, dict) else []
+        q = questions[0] if questions else {}
+        question_text = q.get("question", "Claude is asking a question")
+        title = f"[{label}] Question" if label else "Claude question"
+        if inflight.get("passive"):
+            n_opts = len(q.get("options", []))
+            reason = "Multi-answer question" if q.get("multiSelect") else f"{n_opts} options"
+            body_lines = [question_text, "", f"{reason} — finish on your Mac."]
+            if cwd_short:
+                body_lines.extend(["", f"in {cwd_short}"])
+            publish(cfg, title, "\n".join(body_lines), target, eid, votes=[])
+            return
+        options = inflight.get("options") or [o.get("label", str(i + 1)) for i, o in enumerate(q.get("options", [])[:3])]
+        votes = [(f"opt{i+1}", truncate(opt, 16)) for i, opt in enumerate(options[:3])]
+        body_lines = [question_text]
+        if cwd_short:
+            body_lines.extend(["", f"in {cwd_short}"])
+        publish(cfg, title, "\n".join(body_lines), target, eid, votes=votes)
+        return
+
+    summary = summarize_tool(name, inflight.get("tool_input", {}))
+    lines = [f"Claude has been waiting {delay}s for {name}"]
+    if summary:
+        lines.extend(["", summary])
+    if cwd_short:
+        lines.extend(["", f"in {cwd_short}"])
+    title = f"[{label}] Approve {name}?" if label else f"Approve {name}?"
+    publish(cfg, title, "\n".join(lines), target, eid)
+
+
+def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--notify":
+        return notify_mode(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else DEFAULT_DELAY)
+
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return 0
+    try:
+        cfg = load_config()
+    except FileNotFoundError:
+        print("claude-pager: config missing, run setup", file=sys.stderr)
+        return 0
+
+    event = payload.get("hook_event_name", "")
+    if event == "PreToolUse":
+        handle_pretooluse(payload, cfg)
+    elif event == "PostToolUse":
+        handle_posttooluse(payload, cfg)
+    elif event == "Stop":
+        handle_stop(payload, cfg)
+    elif event == "Notification":
+        handle_notification(payload, cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Per-user setup for claude-pager. Idempotent.
+# Run after the binaries are on PATH (via install.sh or `brew install`).
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/claude-pager"
+CONFIG_PATH="$CONFIG_DIR/config.json"
+LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
+PLIST_PATH="$LAUNCH_AGENT_DIR/com.claudepager.daemon.plist"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+LEGACY_CONFIG="$HOME/.config/wrist-approve/config.json"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
+
+bold "claude-pager setup"
+
+HOOK_BIN="${CLAUDE_PAGER_HOOK:-$(command -v claude-pager-hook || true)}"
+DAEMON_BIN="${CLAUDE_PAGER_DAEMON:-$(command -v claude-pager-daemon || true)}"
+PLIST_TEMPLATE="${CLAUDE_PAGER_PLIST_TEMPLATE:-}"
+
+if [[ -z "$HOOK_BIN" || -z "$DAEMON_BIN" ]]; then
+  echo "claude-pager-hook / claude-pager-daemon not on PATH" >&2
+  echo "install via brew or run install.sh from the source checkout" >&2
+  exit 1
+fi
+
+if [[ -z "$PLIST_TEMPLATE" ]]; then
+  # Look next to the daemon binary.
+  guess="$(dirname "$DAEMON_BIN")/../launchd/com.claudepager.daemon.plist.template"
+  if [[ -f "$guess" ]]; then
+    PLIST_TEMPLATE="$guess"
+  fi
+fi
+
+mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
+
+if [[ -f "$CONFIG_PATH" ]]; then
+  info "config exists, keeping topics and secret"
+elif [[ -f "$LEGACY_CONFIG" ]]; then
+  info "migrating config from wrist-approve"
+  cp "$LEGACY_CONFIG" "$CONFIG_PATH"
+  chmod 600 "$CONFIG_PATH"
+else
+  info "generating new topics and HMAC secret"
+  REQ_TOPIC="cp-req-$(python3 -c 'import secrets; print(secrets.token_urlsafe(16))')"
+  RESP_TOPIC="cp-resp-$(python3 -c 'import secrets; print(secrets.token_urlsafe(16))')"
+  SECRET=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+  python3 - "$CONFIG_PATH" "$REQ_TOPIC" "$RESP_TOPIC" "$SECRET" <<'PY'
+import json, os, sys
+path, req, resp, secret = sys.argv[1:]
+cfg = {
+    "server": "https://ntfy.sh",
+    "request_topic": req,
+    "response_topic": resp,
+    "secret": secret,
+    "tmux_target": "claude:0",
+    "approve_key": "1",
+    "allow_always_key": "2",
+    "deny_key": "3",
+    "gate": ["Bash", "Write", "Edit", "WebFetch"],
+    "delay_seconds": 20,
+}
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+os.chmod(path, 0o600)
+PY
+fi
+
+REQ_TOPIC=$(python3 -c "import json; print(json.load(open('$CONFIG_PATH'))['request_topic'])")
+
+info "installing LaunchAgent"
+mkdir -p "$LAUNCH_AGENT_DIR"
+if [[ -n "$PLIST_TEMPLATE" && -f "$PLIST_TEMPLATE" ]]; then
+  install_dir="$(dirname "$(dirname "$DAEMON_BIN")")"
+  sed -e "s|__INSTALL_DIR__|$install_dir|g" -e "s|__HOME__|$HOME|g" \
+    "$PLIST_TEMPLATE" > "$PLIST_PATH"
+else
+  cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.claudepager.daemon</string>
+    <key>ProgramArguments</key><array><string>$DAEMON_BIN</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$HOME/Library/Logs/claude-pager.log</string>
+    <key>StandardErrorPath</key><string>$HOME/Library/Logs/claude-pager.log</string>
+    <key>EnvironmentVariables</key>
+    <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+</dict>
+</plist>
+PLIST
+fi
+launchctl unload "$PLIST_PATH" 2>/dev/null || true
+launchctl load "$PLIST_PATH"
+
+info "wiring Claude Code hooks (PreToolUse + Notification)"
+mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+python3 - "$CLAUDE_SETTINGS" "$HOOK_BIN" <<'PY'
+import json, sys
+path, hook_cmd = sys.argv[1:]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except FileNotFoundError:
+    cfg = {}
+hooks = cfg.setdefault("hooks", {})
+
+def is_ours(entry):
+    for h in entry.get("hooks", []):
+        cmd = h.get("command", "")
+        if any(s in cmd for s in ("claude-pager-hook", "wrist-approve-hook")):
+            return True
+        if "claude-approve-" in cmd and "ntfy.sh" in cmd:
+            return True
+    return False
+
+for event in ("Notification", "PreToolUse", "PostToolUse", "Stop"):
+    entries = hooks.setdefault(event, [])
+    entries = [e for e in entries if not is_ours(e)]
+    entries.append({"matcher": "", "hooks": [{"type": "command", "command": hook_cmd}]})
+    hooks[event] = entries
+
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+PY
+
+if [[ "${CLAUDE_PAGER_SHELL_WRAPPER:-1}" == "1" ]]; then
+  info "installing shell wrapper for claude command"
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    [[ -f "$rc" ]] || continue
+    if grep -q "claude-pager wrapper" "$rc"; then
+      # Strip any existing wrapper block so we can rewrite with the current version.
+      python3 - "$rc" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p) as f: src = f.read()
+s, e = "# >>> claude-pager wrapper >>>", "# <<< claude-pager wrapper <<<"
+while s in src and e in src:
+    i = src.index(s)
+    j = src.index(e) + len(e)
+    while i > 0 and src[i-1] == "\n": i -= 1
+    while j < len(src) and src[j] == "\n": j += 1
+    src = src[:i] + ("\n" if i > 0 and j < len(src) else "") + src[j:]
+with open(p, "w") as f: f.write(src)
+PY
+    fi
+    cat >> "$rc" <<'WRAP'
+
+# >>> claude-pager wrapper >>>
+# Auto-wrap `claude` in a tmux session called "claude" so claude-pager
+# can route phone approvals to it. Pass --no-tmux to bypass.
+claude() {
+  if [[ "$1" == "--no-tmux" ]]; then
+    shift; command claude "$@"
+    return $?
+  fi
+  if [[ -n "$TMUX" ]] || ! command -v tmux >/dev/null 2>&1; then
+    command claude "$@"
+    return $?
+  fi
+  # Always create a fresh, uniquely-named tmux session per invocation. This
+  # avoids any race between new-session and send-keys, and keeps prompt-routing
+  # to the right session unambiguous.
+  local name=claude i=2
+  while tmux has-session -t "=$name" 2>/dev/null; do
+    name="claude-$i"; i=$((i+1))
+  done
+  # Build a quoted command line so args survive the shell-c invocation.
+  local args="" a
+  for a in "$@"; do
+    args+=" $(printf '%q' "$a")"
+  done
+  tmux new-session -s "$name" "exec ${SHELL:-/bin/zsh} -lic 'command claude${args}'"
+}
+# <<< claude-pager wrapper <<<
+WRAP
+    info "  installed wrapper in $rc"
+  done
+fi
+
+bold ""
+bold "Setup complete."
+echo
+echo "  Subscribe in the ntfy app: $REQ_TOPIC"
+echo "    (or open https://ntfy.sh/$REQ_TOPIC on your phone)"
+echo
+echo "  Start a Claude session inside tmux so the pager can route to it:"
+echo "    tmux new -s claude && claude"
+echo
+echo "  Logs: tail -f ~/Library/Logs/claude-pager.log"

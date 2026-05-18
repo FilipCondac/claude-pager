@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""End-to-end self-test: fires a fake approval notification immediately.
+
+If you tap Approve/Deny on your phone, the daemon will log a delivery (without
+typing into any real Claude session because the inflight target points at a
+non-existent tmux session). Useful to verify the full publish + push + tap +
+receive path without needing Claude to be running.
+"""
+import json
+import os
+import sys
+import subprocess
+
+CONFIG_PATH = os.path.expanduser("~/.config/claude-pager/config.json")
+_self_dir = os.path.dirname(os.path.realpath(__file__))
+HOOK_BIN = (
+    os.environ.get("CLAUDE_PAGER_HOOK")
+    or (os.path.join(_self_dir, "claude-pager-hook") if os.path.exists(os.path.join(_self_dir, "claude-pager-hook")) else "claude-pager-hook")
+)
+
+
+def main():
+    if not os.path.exists(CONFIG_PATH):
+        print("config missing -- run claude-pager-setup", file=sys.stderr)
+        return 1
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+    print(f"firing test notification on topic {cfg['request_topic']}")
+    payload = {
+        "hook_event_name": "Notification",
+        "message": "claude-pager self-test — tap Approve or Deny",
+    }
+    # Temporarily force the idle handler on for this one call.
+    env = dict(os.environ, CLAUDE_PAGER_FORCE_NOTIFY="1")
+    res = subprocess.run(
+        [HOOK_BIN], input=json.dumps(payload), text=True, env=env,
+        capture_output=True,
+    )
+    if res.returncode != 0:
+        print(res.stderr, file=sys.stderr)
+        return res.returncode
+    print("sent. Check your phone, then `claude-pager-status` for delivery log.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+Subscribes to the user's ntfy response topic, verifies HMAC-signed votes from
+the phone, and sends the corresponding keystroke into the tmux session that
+issued the approval prompt (recorded in pending.json by the hook).
+"""
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+CONFIG_DIR = os.path.expanduser("~/.config/claude-pager")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+PENDING_PATH = os.path.join(CONFIG_DIR, "pending.json")
+INFLIGHT_DIR = os.path.join(CONFIG_DIR, "inflight")
+CONFIRMED_DIR = os.path.join(CONFIG_DIR, "confirmed")
+LOG_PATH = os.path.expanduser("~/Library/Logs/claude-pager.log")
+
+
+def log(msg):
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
+    sys.stdout.write(line)
+    sys.stdout.flush()
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+def load_config():
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def verify(secret_hex, vote, nonce, sig):
+    key = bytes.fromhex(secret_hex)
+    expected = hmac.new(key, f"{vote}:{nonce}".encode(), hashlib.sha256).hexdigest()[:16]
+    return hmac.compare_digest(expected, sig)
+
+
+def consume_nonce(nonce):
+    """Pop and return the pending entry for `nonce`, or None if unknown."""
+    try:
+        with open(PENDING_PATH) as f:
+            pending = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    entry = pending.pop(nonce, None)
+    if entry is None:
+        return None
+    tmp = PENDING_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(pending, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PENDING_PATH)
+    return entry
+
+
+def send_keys(target, keys):
+    """keys can be a string (single keystroke + Enter) or a list of tmux key
+    names (sent as-is, no auto-Enter). Returns None on success, error string
+    otherwise."""
+    tmux = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+    if isinstance(keys, str):
+        argv = [tmux, "send-keys", "-t", target, keys, "Enter"]
+    else:
+        argv = [tmux, "send-keys", "-t", target, *keys]
+    res = subprocess.run(argv, capture_output=True, text=True)
+    if res.returncode != 0:
+        log(f"send-keys to {target} failed: {res.stderr.strip()}")
+        return res.stderr.strip() or "unknown error"
+    return None
+
+
+def publish_followup(cfg, title, body, priority="low", tags="white_check_mark"):
+    import urllib.request
+    server = cfg.get("server", "https://ntfy.sh")
+    req = urllib.request.Request(
+        f"{server}/{cfg['request_topic']}",
+        data=body.encode("utf-8"),
+        headers={
+            "Title": title,
+            "Priority": priority,
+            "Tags": tags,
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        log(f"followup publish failed: {e}")
+
+
+def mark_confirmed(eid, vote, target):
+    os.makedirs(CONFIRMED_DIR, exist_ok=True)
+    os.chmod(CONFIRMED_DIR, 0o700)
+    path = os.path.join(CONFIRMED_DIR, f"{eid}.json")
+    with open(path, "w") as f:
+        json.dump({"vote": vote, "target": target, "ts": time.time()}, f)
+    os.chmod(path, 0o600)
+
+
+def handle_message(cfg, body):
+    parts = body.split(":")
+    if len(parts) != 3:
+        log(f"malformed body: {body!r}")
+        return
+    vote, nonce, sig = parts
+    if vote not in ("approve", "allow_always", "deny") and not vote.startswith("opt"):
+        log(f"unknown vote: {vote!r}")
+        return
+    if not verify(cfg["secret"], vote, nonce, sig):
+        log(f"bad signature for nonce {nonce}")
+        return
+    entry = consume_nonce(nonce)
+    if entry is None:
+        log(f"unknown or replayed nonce {nonce}")
+        return
+    eid = entry.get("event_id")
+    if eid and eid != "idle":
+        inflight = os.path.join(INFLIGHT_DIR, f"{eid}.json")
+        if not os.path.exists(inflight):
+            log(f"stale vote for {nonce}: event {eid} already resolved locally")
+            return
+    target = entry.get("target") or cfg.get("tmux_target", "claude:0")
+    if vote.startswith("opt"):
+        # AskUserQuestion: type the option digit + Enter. Falls back from the
+        # arrow-key approach which Claude's question UI ignores.
+        try:
+            n = int(vote[3:])
+        except ValueError:
+            log(f"bad option vote: {vote}")
+            return
+        err = send_keys(target, str(n))
+    else:
+        key_map = {
+            "approve": cfg.get("approve_key", "1"),
+            "allow_always": cfg.get("allow_always_key", "2"),
+            "deny": cfg.get("deny_key", "3"),
+        }
+        err = send_keys(target, key_map[vote])
+    if err is None:
+        log(f"{vote} delivered to {target} (nonce {nonce})")
+        if eid and eid != "idle":
+            mark_confirmed(eid, vote, target)
+            try:
+                os.remove(os.path.join(INFLIGHT_DIR, f"{eid}.json"))
+            except FileNotFoundError:
+                pass
+        if cfg.get("confirm_delivery", True):
+            if vote.startswith("opt"):
+                verb = f"Picked option {vote[3:]}"
+            else:
+                verb = {"approve": "Approved", "allow_always": "Allowed always", "deny": "Denied"}[vote]
+            publish_followup(
+                cfg,
+                f"{verb} - delivered",
+                f"Sent to {target}",
+                priority="low",
+                tags=(
+                    "ballot_box_with_check" if vote.startswith("opt")
+                    else {"approve": "white_check_mark", "allow_always": "lock", "deny": "x"}[vote]
+                ),
+            )
+    else:
+        publish_followup(
+            cfg,
+            "Delivery failed",
+            f"Could not reach {target}: {err}",
+            priority="high",
+            tags="warning",
+        )
+
+
+def stream(cfg):
+    url = f"{cfg.get('server', 'https://ntfy.sh')}/{cfg['response_topic']}/json"
+    req = urllib.request.Request(url, headers={"Accept": "application/x-ndjson"})
+    with urllib.request.urlopen(req, timeout=None) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("event") != "message":
+                continue
+            handle_message(cfg, msg.get("message", ""))
+
+
+def caffeinate_supervisor():
+    """Run `caffeinate -dis` while ~/.config/claude-pager/inflight/ has files.
+    Polls every 2s. Released as soon as no prompts are pending."""
+    import threading
+    proc = {"p": None}
+
+    def have_inflight():
+        try:
+            return any(f.endswith(".json") for f in os.listdir(INFLIGHT_DIR))
+        except FileNotFoundError:
+            return False
+
+    def loop():
+        while True:
+            try:
+                pending = have_inflight()
+                if pending and proc["p"] is None:
+                    proc["p"] = subprocess.Popen(
+                        ["/usr/bin/caffeinate", "-dis"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    log("caffeinate engaged (inflight prompt detected)")
+                elif not pending and proc["p"] is not None:
+                    proc["p"].terminate()
+                    proc["p"] = None
+                    log("caffeinate released (no inflight prompts)")
+            except Exception as e:
+                log(f"caffeinate supervisor error: {e}")
+            time.sleep(2)
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
+def main():
+    cfg = load_config()
+    log(f"daemon started, subscribed to {cfg['response_topic']}")
+    if cfg.get("caffeinate", True):
+        caffeinate_supervisor()
+    backoff = 1
+    while True:
+        try:
+            stream(cfg)
+            backoff = 1
+        except KeyboardInterrupt:
+            log("interrupted, exiting")
+            return 0
+        except Exception as e:
+            log(f"stream error: {e}; reconnecting in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
