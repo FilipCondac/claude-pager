@@ -71,9 +71,10 @@ in my-project
 
 1. Drops the daemon + hook somewhere PATH-reachable
 2. Generates unique topic slugs and a 32-byte HMAC secret in `~/.config/claude-pager/config.json` (mode 600)
-3. Installs a LaunchAgent so the daemon runs at login and restarts on crash
-4. Wires the Notification hook into `~/.claude/settings.json`
-5. Prints the topic name to subscribe in the ntfy iOS app
+3. Writes `~/.config/claude-pager/tmux.conf` (mouse scroll on, 50k-line scrollback) — used only by the auto-wrapped `claude` sessions; your own `~/.tmux.conf` is sourced first so personal settings still apply
+4. Installs a LaunchAgent so the daemon runs at login and restarts on crash
+5. Wires the Notification hook into `~/.claude/settings.json`
+6. Prints the topic name to subscribe in the ntfy iOS app
 
 Re-run it any time after editing config or upgrading.
 

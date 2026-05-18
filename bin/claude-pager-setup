@@ -70,6 +70,17 @@ fi
 
 REQ_TOPIC=$(python3 -c "import json; print(json.load(open('$CONFIG_PATH'))['request_topic'])")
 
+TMUX_CONF="$CONFIG_DIR/tmux.conf"
+info "writing tmux config (mouse scroll on) to $TMUX_CONF"
+cat > "$TMUX_CONF" <<'TMUXCONF'
+# claude-pager tmux config — loaded only for auto-tmux'd Claude sessions.
+# Sources your personal ~/.tmux.conf first, then adds mouse mode so scrolling
+# Claude's history works with the trackpad / mouse wheel.
+source-file -q ~/.tmux.conf
+set -g mouse on
+set -g history-limit 50000
+TMUXCONF
+
 info "installing LaunchAgent"
 mkdir -p "$LAUNCH_AGENT_DIR"
 if [[ -n "$PLIST_TEMPLATE" && -f "$PLIST_TEMPLATE" ]]; then
@@ -174,7 +185,10 @@ claude() {
   for a in "$@"; do
     args+=" $(printf '%q' "$a")"
   done
-  tmux new-session -s "$name" "exec ${SHELL:-/bin/zsh} -lic 'command claude${args}'"
+  local cpconf="$HOME/.config/claude-pager/tmux.conf"
+  local tmuxcmd=(tmux)
+  [[ -f "$cpconf" ]] && tmuxcmd+=(-f "$cpconf")
+  "${tmuxcmd[@]}" new-session -s "$name" "exec ${SHELL:-/bin/zsh} -lic 'command claude${args}'"
 }
 # <<< claude-pager wrapper <<<
 WRAP
