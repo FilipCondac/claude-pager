@@ -33,19 +33,25 @@ in my-project
 
 ## Install
 
-### Homebrew (recommended once released)
+### Homebrew (recommended)
 
 ```
-brew tap REPLACE_OWNER/claude-pager
+brew tap FilipCondac/claude-pager
 brew install claude-pager
 CLAUDE_PAGER_PLIST_TEMPLATE="$(brew --prefix)/share/claude-pager/launchd/com.claudepager.daemon.plist.template" \
   claude-pager-setup
 ```
 
+### One-line web installer
+
+```
+curl -fsSL https://raw.githubusercontent.com/FilipCondac/claude-pager/main/scripts/install-from-web.sh | bash
+```
+
 ### From source
 
 ```
-git clone <repo> ~/claude-pager
+git clone https://github.com/FilipCondac/claude-pager.git ~/claude-pager
 cd ~/claude-pager
 ./install.sh
 ```
